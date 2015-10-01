@@ -83,12 +83,13 @@ func (m *Mutex) tryLock() (bool, error) {
 	if err != nil {
 		return false, err
 	}
+	log.Debugf("query applied status: %v", applied)
 	if applied {
 		log.Debugf("locked mutex '%s' as '%s'", m.LockName, m.LockHolder)
 	} else {
-		// check for stale lock
+		// check for stale lock, or pre-existing lock with the same holder name
 		lockExpiration := data["expiration_time"].(time.Time)
-		if !lockExpiration.IsZero() && lockExpiration.Before(now) {
+		if (!lockExpiration.IsZero() && lockExpiration.Before(now)) || data["lock_holder"].(string) == m.LockHolder {
 			// existing lock is stale
 			queryString := fmt.Sprintf(
 				"UPDATE \"%s\".\"%s\" SET lock_holder = '%s', acquired_time = '%s', expiration_time = '%s' WHERE lock_name = '%s' IF acquired_time = '%s'",
