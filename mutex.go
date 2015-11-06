@@ -2,14 +2,18 @@ package stcql
 
 import (
 	"fmt"
+	"math/big"
+	"strings"
 	"sync"
 	"time"
 
 	log "github.com/Sirupsen/logrus"
 	"github.com/gocql/gocql"
+	"crypto/rand"
 )
 
 const CQLTimeFmt = "2006-01-02 15:04:05-0700"
+const CQLRetries = 5
 
 // Mutex represents a mutex that is acquired by inserting a row
 // into a Cassandra table using a lightweight transaction.
@@ -26,6 +30,36 @@ type Mutex struct {
 	RetryTime time.Duration
 	// Timeout is the duration after which to give up acquiring the mutex
 	Timeout time.Duration
+}
+
+func (m *Mutex) query(q string) (applied bool, err error, data map[string]interface{}) {
+	data = map[string]interface{}{}
+	for t := 0; t <= CQLRetries; t++ {
+		// Sleep up a random number of milliseconds up to 500. This makes it less likely
+		// we'll conflict with other cqllock instances which can cause the lightweight
+		// transaction to fail to complete.
+		r, err := rand.Int(rand.Reader, big.NewInt(500))
+		if err != nil {
+			log.Fatal("failed to generate random number for query wait")
+		}
+		d := time.Duration(r.Int64()) * time.Millisecond
+		log.Debugf("waiting %v before performing query", d)
+		time.Sleep(d)
+
+		log.Debugf("executing query")
+		applied, err = m.Session.Query(q).MapScanCAS(data)
+		if err != nil {
+			// Retry on this error. C* returns this if there's an internal timeout, but it's
+			// almost always intermittent.
+			if strings.HasPrefix(err.Error(), "Operation timed out - received only") {
+				log.Debugf("retrying query '%s'", q)
+				continue
+			}
+		}
+		// if we didn't retry, we're done looping
+		break
+	}
+	return
 }
 
 // Lock attempts to acquire mutex m. If the lock is already in use, the calling
@@ -78,8 +112,7 @@ func (m *Mutex) tryLock() (bool, error) {
 		m.LockHolder,
 	)
 	log.Debugf("trying locking query string: %s", queryString)
-	data := map[string]interface{}{}
-	applied, err := m.Session.Query(queryString).MapScanCAS(data)
+	applied, err, data := m.query(queryString)
 	if err != nil {
 		return false, err
 	}
@@ -102,8 +135,7 @@ func (m *Mutex) tryLock() (bool, error) {
 				data["acquired_time"].(time.Time).Format(CQLTimeFmt),
 			)
 			log.Debugf("trying locking query string: %s", queryString)
-			data = map[string]interface{}{}
-			applied, err = m.Session.Query(queryString).MapScanCAS(data)
+			applied, err, data = m.query(queryString)
 			if err != nil {
 				return false, err
 			}
@@ -130,8 +162,7 @@ func (m *Mutex) Unlock() error {
 		m.LockHolder,
 	)
 	log.Debugf("trying unlock query string: %s", queryString)
-	data := map[string]interface{}{}
-	applied, err := m.Session.Query(queryString).MapScanCAS(data)
+	applied, err, data := m.query(queryString)
 	if err != nil {
 		return err
 	}
